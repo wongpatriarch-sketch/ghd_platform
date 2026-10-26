@@ -18,6 +18,8 @@ from utils.file_helper import sanitize_original_name
 
 club_bp = Blueprint('club', __name__, url_prefix='/api/club')
 ALLOWED_COVER_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'gif'}
+# 设备台账状态。'报废' 不计入首页的「在库装备」数量，且不可领用。
+ALLOWED_EQUIPMENT_STATUS = ('正常', '维修中', '报废', '已遗失')
 
 
 def _payload():
@@ -42,6 +44,59 @@ def _save_cover(kind):
         os.remove(target)
         raise ValueError('封面图片不能超过 10MB')
     return filename
+
+
+def _discard_cover(kind, filename):
+    """替换或删除封面后清理旧图片，避免 uploads 目录堆积孤儿文件。
+
+    必须在数据库事务提交成功之后调用：否则事务回滚了、图片却已删除，
+    会造成数据库记录与磁盘文件不一致。
+    """
+    if not filename:
+        return
+    path = os.path.join(current_app.config['UPLOAD_FOLDER'], 'covers', kind, filename)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        current_app.logger.warning('旧封面清理失败: %s', path)
+
+
+def _resolve_equipment_category(value):
+    """把请求里的分类标识解析成 EquipmentCategory，非法输入一律返回 None。
+
+    直接用 Query.get(None) 会抛 InvalidRequestError 变成 500，这里统一收敛成
+    「查不到就是 None」，让调用方返回 4xx。
+    """
+    try:
+        category_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return db.session.get(EquipmentCategory, category_id)
+
+
+def _resolve_int(value, fallback=None):
+    """安全地把请求参数转成整数，失败时返回 fallback 而不是抛异常。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _as_text(value):
+    """把请求字段安全地转成去掉首尾空白的字符串。
+
+    浏览器表单提交的 multipart 字段一定是字符串，但直接调 JSON 接口可以传数字、
+    数组或对象，这时 `(value or '').strip()` 会抛 AttributeError 变成 500。
+    统一走这个函数：标量转成字符串，容器类型当作空值，交给后续的必填校验去返回 4xx。
+    """
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value).strip()
+    return ''
 
 
 @club_bp.route('/covers/<string:kind>/<path:filename>', methods=['GET'])
@@ -160,12 +215,19 @@ def overview():
     now = datetime.now()
     active_borrows = EquipmentUsage.query.filter_by(status='使用中').count()
     pending_media = ActivityMedia.query.filter_by(review_status='待审阅').count()
-    upcoming = ClubActivity.query.filter(ClubActivity.start_time >= now).order_by(ClubActivity.start_time).limit(4).all()
+    # 已终止的项目不该再出现在「近期活动」里，口径与活动课表保持一致。
+    # activity_count 仍统计全部项目，这样首页数字和活动项目页「全部」标签下的
+    # 「N 个项目」能对上。
+    upcoming_query = ClubActivity.query.filter(
+        ClubActivity.start_time >= now, ClubActivity.status != '已终止')
+    upcoming = upcoming_query.order_by(ClubActivity.start_time).limit(4).all()
     return jsonify(
         member_count=User.query.filter(User.status.in_((1, 3))).count(),
         activity_count=ClubActivity.query.count(),
-        upcoming_count=ClubActivity.query.filter(ClubActivity.start_time >= now).count(),
-        equipment_count=db.session.query(func.sum(Equipment.total_quantity)).scalar() or 0,
+        upcoming_count=upcoming_query.count(),
+        # 已报废的设备不再计入「在库装备」
+        equipment_count=db.session.query(func.sum(Equipment.total_quantity)).filter(
+            Equipment.status != '报废').scalar() or 0,
         active_borrows=active_borrows,
         pending_media=pending_media,
         upcoming=[a.to_dict() for a in upcoming],
@@ -185,8 +247,10 @@ def time_overview():
         return jsonify(msg='时间范围格式错误'), 400
 
     events = []
+    # 时间中心的日程同样排除已终止项目，否则取消掉的活动仍会被当成待办提醒。
     activities = ClubActivity.query.filter(
-        ClubActivity.start_time >= start, ClubActivity.start_time <= end
+        ClubActivity.start_time >= start, ClubActivity.start_time <= end,
+        ClubActivity.status != '已终止',
     ).order_by(ClubActivity.start_time).all()
     for row in activities:
         events.append({
@@ -674,26 +738,118 @@ def equipment_list():
     if denied:
         return denied
     data = _payload()
-    qty = int(data.get('total_quantity', 1))
+    asset_code = _as_text(data.get('asset_code'))
+    equipment_name = _as_text(data.get('equipment_name'))
+    category = _resolve_equipment_category(data.get('category_id'))
+    # 先做完所有校验再落盘封面，避免请求被拒后在 uploads 里留下孤儿图片
+    if not asset_code or not equipment_name or category is None:
+        return jsonify(msg='资产编号、设备名称和有效分类均为必填项'), 400
+    qty = _resolve_int(data.get('total_quantity', 1))
+    if qty is None:
+        return jsonify(msg='设备数量必须是整数'), 400
     if qty < 1:
         return jsonify(msg='设备数量至少为 1'), 400
+    status = _as_text(data.get('status')) or '正常'
+    if status not in ALLOWED_EQUIPMENT_STATUS:
+        return jsonify(msg=f'设备状态只能是 {"、".join(ALLOWED_EQUIPMENT_STATUS)}'), 400
     try:
         cover_image = _save_cover('equipment')
     except ValueError as error:
         return jsonify(msg=str(error)), 415
-    row = Equipment(asset_code=(data.get('asset_code') or '').strip(),
-                    equipment_name=(data.get('equipment_name') or '').strip(),
-                    category_id=data.get('category_id'), total_quantity=qty,
-                    available_quantity=qty, storage_location=data.get('storage_location'),
-                    notes=data.get('notes'), cover_image=cover_image)
-    if not row.asset_code or not row.equipment_name or not EquipmentCategory.query.get(row.category_id):
-        return jsonify(msg='资产编号、设备名称和有效分类均为必填项'), 400
+    row = Equipment(asset_code=asset_code, equipment_name=equipment_name,
+                    category_id=category.category_id, total_quantity=qty,
+                    available_quantity=qty,
+                    storage_location=_as_text(data.get('storage_location')) or None,
+                    notes=_as_text(data.get('notes')) or None,
+                    status=status, cover_image=cover_image)
     db.session.add(row)
-    db.session.flush()
-    _record(user, 'equipment', '登记设备', 'equipment', row, row.equipment_name,
-            f'资产编号：{row.asset_code} · 数量：{row.total_quantity}')
-    db.session.commit()
+    try:
+        db.session.flush()
+        _record(user, 'equipment', '登记设备', 'equipment', row, row.equipment_name,
+                f'资产编号：{row.asset_code} · 数量：{row.total_quantity}')
+        db.session.commit()
+    except IntegrityError:
+        # asset_code 是唯一约束，重复登记原本会抛 500
+        db.session.rollback()
+        _discard_cover('equipment', cover_image)
+        return jsonify(msg=f'资产编号 {asset_code} 已存在'), 409
     return jsonify(msg='设备已登记', equipment=row.to_dict()), 201
+
+
+@club_bp.route('/equipment/<int:equipment_id>', methods=['PUT', 'DELETE'])
+@require_auth
+def manage_equipment(equipment_id):
+    user = get_current_user()
+    denied = _deny_unless(_can_department_edit(user, '后勤部'), '仅后勤部授权人员或队长可管理设备')
+    if denied:
+        return denied
+    row = Equipment.query.get_or_404(equipment_id)
+    occupied = row.total_quantity - row.available_quantity
+
+    if request.method == 'DELETE':
+        if occupied > 0:
+            return jsonify(msg=f'仍有 {occupied} 件在外未归还，请先完成归还'), 409
+        if EquipmentUsage.query.filter_by(equipment_id=row.equipment_id).count():
+            return jsonify(msg='该设备已有领用历史，为保留台账记录不能删除；请把状态改为「报废」'), 409
+        name, code, cover = row.equipment_name, row.asset_code, row.cover_image
+        _record(user, 'equipment', '删除设备', 'equipment', row, name, f'资产编号：{code}')
+        db.session.delete(row)
+        db.session.commit()
+        _discard_cover('equipment', cover)
+        return jsonify(msg='设备已删除'), 200
+
+    data = _payload()
+    # 先把所有新值算出来、全部校验通过，再统一写回 row。这样中途 return 时 row
+    # 仍是原样，不会在会话里留下半截修改（脏对象一旦被后续 commit 带出去，
+    # 就会以 NOT NULL / 唯一约束冲突的形式在别处爆掉）。
+    pending = {}
+    if 'total_quantity' in data:
+        new_total = _resolve_int(data.get('total_quantity'))
+        if new_total is None:
+            return jsonify(msg='设备数量必须是整数'), 400
+        if new_total < 1:
+            return jsonify(msg='设备数量至少为 1'), 400
+        if new_total < occupied:
+            return jsonify(msg=f'当前有 {occupied} 件在外未归还，总量不能少于该数量'), 409
+        # 调整总量时保持「在外占用数」不变，只改可用量
+        pending['total_quantity'] = new_total
+        pending['available_quantity'] = new_total - occupied
+    if 'category_id' in data:
+        category = _resolve_equipment_category(data.get('category_id'))
+        if category is None:
+            return jsonify(msg='设备分类不存在'), 404
+        pending['category_id'] = category.category_id
+    if 'status' in data:
+        status = _as_text(data.get('status'))
+        if status not in ALLOWED_EQUIPMENT_STATUS:
+            return jsonify(msg=f'设备状态只能是 {"、".join(ALLOWED_EQUIPMENT_STATUS)}'), 400
+        pending['status'] = status
+    for field in ('asset_code', 'equipment_name', 'storage_location', 'notes'):
+        if field in data:
+            pending[field] = _as_text(data[field])
+    if (not pending.get('asset_code', row.asset_code)
+            or not pending.get('equipment_name', row.equipment_name)):
+        return jsonify(msg='资产编号和设备名称不能为空'), 400
+    try:
+        new_cover = _save_cover('equipment')
+    except ValueError as error:
+        return jsonify(msg=str(error)), 415
+    replaced_cover = row.cover_image if new_cover else None
+    if new_cover:
+        pending['cover_image'] = new_cover
+    attempted_code = pending.get('asset_code', row.asset_code)
+    for field, value in pending.items():
+        setattr(row, field, value)
+    try:
+        _record(user, 'equipment', '更新设备台账', 'equipment', row, row.equipment_name,
+                f'资产编号：{row.asset_code} · 总量：{row.total_quantity} · 状态：{row.status}')
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        _discard_cover('equipment', new_cover)
+        return jsonify(msg=f'资产编号 {attempted_code} 已存在'), 409
+    _discard_cover('equipment', replaced_cover)
+    return jsonify(msg='设备信息已更新', equipment=row.to_dict()), 200
 
 
 @club_bp.route('/equipment/usages', methods=['GET'])
@@ -712,8 +868,12 @@ def equipment_usages():
 def borrow_equipment(equipment_id):
     user = get_current_user()
     equipment = Equipment.query.get_or_404(equipment_id)
+    if equipment.status != '正常':
+        return jsonify(msg=f'该设备当前状态为「{equipment.status}」，不可领用'), 409
     data = request.get_json() or {}
-    qty = int(data.get('quantity', 1))
+    qty = _resolve_int(data.get('quantity', 1))
+    if qty is None:
+        return jsonify(msg='领用数量必须是整数'), 400
     if qty < 1 or qty > equipment.available_quantity:
         return jsonify(msg=f'设备占用冲突：当前仅剩 {equipment.available_quantity} 件可用'), 409
     try:
@@ -765,8 +925,10 @@ def socials():
     if denied:
         return denied
     data = request.get_json() or {}
-    row = SocialAccount(platform=data.get('platform'), account_name=data.get('account_name'),
-                        link_url=data.get('link_url'), icon=data.get('icon'))
+    row = SocialAccount(platform=_as_text(data.get('platform')) or None,
+                        account_name=_as_text(data.get('account_name')) or None,
+                        link_url=_as_text(data.get('link_url')) or None,
+                        icon=_as_text(data.get('icon')) or None)
     if not row.platform or not row.account_name or not row.link_url:
         return jsonify(msg='平台、账号名称和链接均不能为空'), 400
     db.session.add(row)
@@ -775,6 +937,38 @@ def socials():
             row.account_name)
     db.session.commit()
     return jsonify(msg='社媒账号已添加', account=row.to_dict()), 201
+
+
+@club_bp.route('/office/socials/<int:account_id>', methods=['PUT', 'DELETE'])
+@require_auth
+def manage_social(account_id):
+    user = get_current_user()
+    denied = _deny_unless(_can_department_edit(user, '综合办公室'), '仅综合办公室授权人员或队长可维护社媒账号')
+    if denied:
+        return denied
+    row = SocialAccount.query.get_or_404(account_id)
+
+    if request.method == 'DELETE':
+        platform, account_name = row.platform, row.account_name
+        _record(user, 'office', '删除社媒账号', 'account', row, platform, account_name)
+        db.session.delete(row)
+        db.session.commit()
+        return jsonify(msg='社媒账号已删除'), 200
+
+    data = request.get_json() or {}
+    # 先算出合并后的完整值再校验，避免中途返回 400 时把 None 留在会话里
+    merged = {field: getattr(row, field)
+              for field in ('platform', 'account_name', 'link_url', 'icon')}
+    for field in merged:
+        if field in data:
+            merged[field] = _as_text(data[field]) or None
+    if not merged['platform'] or not merged['account_name'] or not merged['link_url']:
+        return jsonify(msg='平台、账号名称和链接均不能为空'), 400
+    for field, value in merged.items():
+        setattr(row, field, value)
+    _record(user, 'office', '更新社媒账号', 'account', row, row.platform, row.account_name)
+    db.session.commit()
+    return jsonify(msg='社媒账号已更新', account=row.to_dict()), 200
 
 
 @club_bp.route('/office/archives', methods=['GET', 'POST'])
@@ -796,9 +990,11 @@ def archives():
     linked_file = db.session.get(File, file_id)
     if not linked_file:
         return jsonify(msg='请先上传需要归档的文件'), 404
-    row = ClubArchive(title=(data.get('title') or '').strip(),
-                      archive_type=data.get('archive_type', '其他'), file_id=linked_file.file_id,
-                      owner_id=user.user_id, description=data.get('description'))
+    row = ClubArchive(title=_as_text(data.get('title')),
+                      archive_type=_as_text(data.get('archive_type')) or '其他',
+                      file_id=linked_file.file_id,
+                      owner_id=user.user_id,
+                      description=_as_text(data.get('description')) or None)
     if not row.title:
         return jsonify(msg='档案标题不能为空'), 400
     db.session.add(row)
@@ -807,6 +1003,52 @@ def archives():
             row.archive_type)
     db.session.commit()
     return jsonify(msg='文件已归档', archive=row.to_dict()), 201
+
+
+@club_bp.route('/office/archives/<int:archive_id>', methods=['PUT', 'DELETE'])
+@require_auth
+def manage_archive(archive_id):
+    user = get_current_user()
+    denied = _deny_unless(_can_department_edit(user, '综合办公室'), '仅综合办公室授权人员或队长可管理档案')
+    if denied:
+        return denied
+    row = ClubArchive.query.get_or_404(archive_id)
+
+    if request.method == 'DELETE':
+        # 只解除归档关系，不动底层文件：同一个文件可能还被活动素材引用。
+        title, archive_type = row.title, row.archive_type
+        _record(user, 'archive', '删除档案', 'archive', row, title, archive_type)
+        db.session.delete(row)
+        db.session.commit()
+        return jsonify(msg='档案已删除，原始文件保留在文件库中'), 200
+
+    data = request.get_json() or {}
+    # 同 manage_equipment：全部校验通过后再写回，中途返回不留脏对象
+    pending = {}
+    if 'title' in data:
+        pending['title'] = _as_text(data['title'])
+    if not pending.get('title', row.title):
+        return jsonify(msg='档案标题不能为空'), 400
+    if 'archive_type' in data:
+        archive_type = _as_text(data['archive_type'])
+        if archive_type:
+            pending['archive_type'] = archive_type
+    if 'description' in data:
+        pending['description'] = _as_text(data['description']) or None
+    if 'file_id' in data:
+        try:
+            file_id = int(data['file_id'])
+        except (TypeError, ValueError):
+            return jsonify(msg='缺少有效的文件标识'), 400
+        linked_file = db.session.get(File, file_id)
+        if not linked_file:
+            return jsonify(msg='请先上传需要归档的文件'), 404
+        pending['file_id'] = linked_file.file_id
+    for field, value in pending.items():
+        setattr(row, field, value)
+    _record(user, 'archive', '更新档案', 'archive', row, row.title, row.archive_type)
+    db.session.commit()
+    return jsonify(msg='档案已更新', archive=row.to_dict()), 200
 
 
 @club_bp.route('/office/media', methods=['GET'])

@@ -207,5 +207,216 @@ class ClubApiTest(unittest.TestCase):
         self.assertEqual(schedule_after, [])
 
 
+    # ── 第二梯队：设备/社媒/档案的编辑删除，以及已终止活动的统计口径 ──────────
+
+    def test_equipment_update_and_delete(self):
+        updated = self.client.put('/api/club/equipment/1', headers=self.headers, data={
+            'equipment_name': '礼宾枪（新）', 'status': '维修中',
+            'storage_location': '器材室 C 区', 'total_quantity': '5',
+        }, content_type='multipart/form-data')
+        self.assertEqual(updated.status_code, 200)
+        payload = updated.get_json()['equipment']
+        self.assertEqual(payload['equipment_name'], '礼宾枪（新）')
+        self.assertEqual(payload['status'], '维修中')
+        self.assertEqual(payload['total_quantity'], 5)
+        self.assertEqual(payload['available_quantity'], 5)
+        self.assertEqual(payload['storage_location'], '器材室 C 区')
+
+        blocked = self.client.post('/api/club/equipment/1/borrow', headers=self.headers,
+                                   json={'quantity': 1})
+        self.assertEqual(blocked.status_code, 409, '非正常状态的设备不应可领用')
+
+        self.client.put('/api/club/equipment/1', headers=self.headers, json={'status': '正常'})
+        borrowed = self.client.post('/api/club/equipment/1/borrow', headers=self.headers,
+                                    json={'quantity': 2})
+        self.assertEqual(borrowed.status_code, 201)
+
+        shrink = self.client.put('/api/club/equipment/1', headers=self.headers,
+                                 json={'total_quantity': 1})
+        self.assertEqual(shrink.status_code, 409, '总量不能低于在外占用数')
+        self.assertEqual(self.client.delete('/api/club/equipment/1',
+                                            headers=self.headers).status_code, 409)
+
+        self.client.put('/api/club/equipment/usages/1/return', headers=self.headers, json={})
+        still_blocked = self.client.delete('/api/club/equipment/1', headers=self.headers)
+        self.assertEqual(still_blocked.status_code, 409)
+        self.assertIn('报废', still_blocked.get_json()['msg'])
+
+    def test_equipment_delete_without_history(self):
+        created = self.client.post('/api/club/equipment', headers=self.headers, json={
+            'asset_code': 'T-DEL-1', 'equipment_name': '待删除设备',
+            'category_id': 1, 'total_quantity': 1})
+        self.assertEqual(created.status_code, 201)
+        new_id = created.get_json()['equipment']['equipment_id']
+        self.assertEqual(self.client.delete(f'/api/club/equipment/{new_id}',
+                                            headers=self.headers).status_code, 200)
+        listing = self.client.get('/api/club/equipment', headers=self.headers).get_json()
+        self.assertNotIn(new_id, [row['equipment_id'] for row in listing['equipment']])
+
+    def test_duplicate_asset_code_returns_409(self):
+        """资产编号是唯一约束，重复登记原本会抛 IntegrityError 变成 500。"""
+        dup = self.client.post('/api/club/equipment', headers=self.headers, json={
+            'asset_code': 'T-001', 'equipment_name': '重复编号', 'category_id': 1})
+        self.assertEqual(dup.status_code, 409)
+
+    def test_equipment_malformed_input_returns_4xx(self):
+        cases = [
+            {},
+            {'asset_code': 'X-1', 'equipment_name': '缺分类'},
+            {'asset_code': 'X-2', 'equipment_name': '分类非数字', 'category_id': 'abc'},
+            {'asset_code': 'X-3', 'equipment_name': '数量非数字', 'category_id': 1,
+             'total_quantity': 'abc'},
+            {'asset_code': 'X-4', 'equipment_name': '状态非法', 'category_id': 1,
+             'status': '不存在的状态'},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                response = self.client.post('/api/club/equipment', headers=self.headers,
+                                            json=payload)
+                self.assertIn(response.status_code, (400, 404))
+
+    def test_equipment_management_requires_logistics_or_captain(self):
+        denied = self.client.put('/api/club/equipment/1', headers=self.member_headers,
+                                 json={'equipment_name': '非法改名'})
+        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(self.client.delete('/api/club/equipment/1',
+                                            headers=self.member_headers).status_code, 403)
+
+    def test_scrapped_equipment_excluded_from_stock_count(self):
+        before = self.client.get('/api/club/overview', headers=self.headers).get_json()
+        self.assertEqual(before['equipment_count'], 2)
+        self.client.put('/api/club/equipment/1', headers=self.headers, json={'status': '报废'})
+        after = self.client.get('/api/club/overview', headers=self.headers).get_json()
+        self.assertEqual(after['equipment_count'], 0)
+
+    def test_social_update_and_delete(self):
+        created = self.client.post('/api/club/office/socials', headers=self.headers, json={
+            'platform': '微信公众号', 'account_name': '校国旗护卫队',
+            'link_url': 'https://example.com'})
+        self.assertEqual(created.status_code, 201)
+        account_id = created.get_json()['account']['account_id']
+
+        updated = self.client.put(f'/api/club/office/socials/{account_id}', headers=self.headers,
+                                  json={'account_name': '改名后的账号'})
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.get_json()['account']['account_name'], '改名后的账号')
+        self.assertEqual(updated.get_json()['account']['platform'], '微信公众号',
+                         '未提交的字段应保持不变')
+
+        blank = self.client.put(f'/api/club/office/socials/{account_id}', headers=self.headers,
+                                json={'platform': '   '})
+        self.assertEqual(blank.status_code, 400)
+
+        self.assertEqual(self.client.delete(f'/api/club/office/socials/{account_id}',
+                                            headers=self.headers).status_code, 200)
+        listing = self.client.get('/api/club/office/socials', headers=self.headers).get_json()
+        self.assertEqual(listing['accounts'], [])
+
+    def test_archive_update_and_delete_keeps_file(self):
+        uploaded = self.client.post('/api/files/upload', headers=self.headers, data={
+            'file': (BytesIO(b'pdf-bytes'), '制度汇编.pdf'), 'visibility': '1',
+        }, content_type='multipart/form-data')
+        self.assertEqual(uploaded.status_code, 201)
+        file_id = uploaded.get_json()['file']['file_id']
+
+        created = self.client.post('/api/club/office/archives', headers=self.headers, json={
+            'title': '制度文件', 'archive_type': '制度文件', 'file_id': file_id})
+        self.assertEqual(created.status_code, 201)
+        archive_id = created.get_json()['archive']['archive_id']
+
+        updated = self.client.put(f'/api/club/office/archives/{archive_id}', headers=self.headers,
+                                  json={'title': '2026 制度汇编', 'archive_type': '其他'})
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.get_json()['archive']['title'], '2026 制度汇编')
+
+        self.assertEqual(self.client.delete(f'/api/club/office/archives/{archive_id}',
+                                            headers=self.headers).status_code, 200)
+        still_there = self.client.get(f'/api/files/{file_id}', headers=self.headers)
+        self.assertEqual(still_there.status_code, 200, '删除档案不应连带删掉原始文件')
+
+    def test_archive_management_requires_office_or_captain(self):
+        created = self.client.post('/api/club/office/socials', headers=self.headers, json={
+            'platform': '测试平台', 'account_name': '账号', 'link_url': 'https://example.com'})
+        account_id = created.get_json()['account']['account_id']
+        self.assertEqual(self.client.put(f'/api/club/office/socials/{account_id}',
+                                         headers=self.member_headers,
+                                         json={'account_name': 'x'}).status_code, 403)
+        self.assertEqual(self.client.delete(f'/api/club/office/socials/{account_id}',
+                                            headers=self.member_headers).status_code, 403)
+
+    def test_terminated_activity_excluded_from_overview_and_time_center(self):
+        """三处口径统一：课表、首页近期活动、时间中心都排除已终止项目。"""
+        now = datetime.now()
+        created = self.client.post('/api/club/activities', headers=self.headers, json={
+            'title': '将被终止', 'start_time': (now + timedelta(days=1)).isoformat()})
+        activity_id = created.get_json()['activity']['activity_id']
+
+        before = self.client.get('/api/club/overview', headers=self.headers).get_json()
+        self.assertEqual(before['upcoming_count'], 1)
+        self.assertEqual(len(before['upcoming']), 1)
+
+        self.client.post(f'/api/club/activities/{activity_id}/terminate',
+                         headers=self.headers, json={'reason': '天气原因'})
+
+        after = self.client.get('/api/club/overview', headers=self.headers).get_json()
+        self.assertEqual(after['upcoming_count'], 0)
+        self.assertEqual(after['upcoming'], [])
+        self.assertEqual(after['activity_count'], 1,
+                         '总数仍含已终止，与活动项目页「全部」标签保持一致')
+
+        time_data = self.client.get('/api/club/time/overview', headers=self.headers,
+                                    query_string={
+                                        'start': now.isoformat(),
+                                        'end': (now + timedelta(days=7)).isoformat(),
+                                    }).get_json()
+        self.assertEqual(time_data['activity_count'], 0)
+        self.assertEqual(time_data['events'], [])
+
+
+    def test_non_string_fields_do_not_500(self):
+        """直接调 JSON 接口能传数字、数组、对象，一律收敛成 4xx 或按文本处理。"""
+        cases = [
+            ('put', '/api/club/equipment/1', {'equipment_name': 123}),
+            ('put', '/api/club/equipment/1', {'notes': ['a', 'b']}),
+            ('put', '/api/club/equipment/1', {'storage_location': {'a': 1}}),
+            ('put', '/api/club/equipment/1', {'status': 123}),
+            ('put', '/api/club/equipment/1', {'total_quantity': 'abc'}),
+            ('put', '/api/club/equipment/1', {'category_id': 'abc'}),
+            ('put', '/api/club/equipment/1', {'category_id': None}),
+            ('post', '/api/club/equipment',
+             {'asset_code': 123, 'equipment_name': 'x', 'category_id': 1}),
+        ]
+        for method, url, payload in cases:
+            with self.subTest(payload=payload):
+                sender = self.client.put if method == 'put' else self.client.post
+                response = sender(url, headers=self.headers, json=payload)
+                self.assertLess(response.status_code, 500)
+
+    def test_rejected_update_does_not_poison_session(self):
+        """校验失败返回 4xx 后，会话里不能留下半截修改去污染后续请求。
+
+        改成「先算新值、全部校验通过再写回」之前，把 link_url 传成数组会让
+        row.link_url 变成 None 并留在会话中，下一个需要 commit 的请求就会
+        以 NOT NULL 约束冲突的形式爆掉。
+        """
+        social = self.client.post('/api/club/office/socials', headers=self.headers, json={
+            'platform': '测试平台', 'account_name': '账号',
+            'link_url': 'https://example.com'})
+        account_id = social.get_json()['account']['account_id']
+
+        rejected = self.client.put(f'/api/club/office/socials/{account_id}',
+                                   headers=self.headers, json={'link_url': ['不是字符串']})
+        self.assertEqual(rejected.status_code, 400)
+
+        uploaded = self.client.post('/api/files/upload', headers=self.headers, data={
+            'file': (BytesIO(b'pdf-bytes'), '后续上传.pdf'), 'visibility': '1',
+        }, content_type='multipart/form-data')
+        self.assertEqual(uploaded.status_code, 201, '被拒的修改不应影响后续写库请求')
+
+        listing = self.client.get('/api/club/office/socials', headers=self.headers).get_json()
+        self.assertEqual(listing['accounts'][0]['link_url'], 'https://example.com',
+                         '被拒的修改不应落库')
+
+
 if __name__ == '__main__':
     unittest.main()
